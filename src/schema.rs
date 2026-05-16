@@ -1,13 +1,17 @@
-//! Shared metadata schema records.
+//! Shared metadata schema records and protocol schema catalog.
 //!
 //! Doc 42 assigns `alani-protocol` ownership for device descriptors, corpus
 //! metadata, and model metadata. Feature crates may refine implementation
 //! details, but cross-repository contracts should flow through these stable
 //! protocol schemas.
 
+use crate::audit::AUDIT_EVENT_SCHEMA_VERSION;
+use crate::config::CONFIG_SCHEMA_VERSION;
+use crate::ipc::IPC_SCHEMA_VERSION;
+use crate::message::{MAX_INLINE_PAYLOAD_BYTES, MESSAGE_SCHEMA_VERSION};
 use crate::{
     validate_label, validate_redaction, validate_schema_version, DataClass, ProtocolError,
-    ProtocolResult, RedactionState, TraceContext,
+    ProtocolResult, RedactionState, TraceContext, MAX_PROTOCOL_LABEL_LEN,
 };
 
 /// Schema registry version.
@@ -27,6 +31,10 @@ pub const MAX_METADATA_LABEL_LEN: usize = 128;
 pub const MAX_METADATA_URI_LEN: usize = 256;
 /// Maximum corpus labels.
 pub const MAX_CORPUS_LABELS: usize = 8;
+/// Number of protocol schemas currently owned by this crate.
+pub const PROTOCOL_SCHEMA_COUNT: usize = 7;
+/// Default maximum serialized protocol metadata record length.
+pub const MAX_SCHEMA_RECORD_LEN: usize = 16 * 1024;
 
 /// Schema version record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,9 +51,21 @@ impl<'a> SchemaVersion<'a> {
         Self { kind, version }
     }
 
+    /// Creates the current schema version for a kind.
+    pub const fn current(kind: SchemaKind) -> Self {
+        Self {
+            kind,
+            version: kind.expected_version(),
+        }
+    }
+
     /// Validates schema version metadata.
     pub fn validate(self) -> ProtocolResult<()> {
-        validate_schema_version(self.version)
+        validate_schema_version(self.version)?;
+        if self.version.as_bytes() != self.kind.expected_version().as_bytes() {
+            return Err(ProtocolError::InvalidSchemaVersion);
+        }
+        Ok(())
     }
 }
 
@@ -82,6 +102,193 @@ impl SchemaKind {
             Self::ModelMetadata => "model_metadata",
         }
     }
+
+    /// Expected schema version for this schema kind.
+    pub const fn expected_version(self) -> &'static str {
+        match self {
+            Self::Message => MESSAGE_SCHEMA_VERSION,
+            Self::Ipc => IPC_SCHEMA_VERSION,
+            Self::AuditEvent => AUDIT_EVENT_SCHEMA_VERSION,
+            Self::Config => CONFIG_SCHEMA_VERSION,
+            Self::DeviceDescriptor => DEVICE_DESCRIPTOR_SCHEMA_VERSION,
+            Self::CorpusMetadata => CORPUS_METADATA_SCHEMA_VERSION,
+            Self::ModelMetadata => MODEL_METADATA_SCHEMA_VERSION,
+        }
+    }
+}
+
+/// Wire/data format family for protocol-owned schemas.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProtocolWireFormat {
+    /// Rust API contract with no serialized artifact promised yet.
+    RustApi = 1,
+    /// Single JSON document.
+    Json = 2,
+    /// Newline-delimited JSON records.
+    JsonLines = 3,
+    /// TOML document.
+    Toml = 4,
+    /// Binary envelope aligned with ABI-facing consumers.
+    BinaryAbi = 5,
+}
+
+impl ProtocolWireFormat {
+    /// Stable format label.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::RustApi => "rust_api",
+            Self::Json => "json",
+            Self::JsonLines => "jsonl",
+            Self::Toml => "toml",
+            Self::BinaryAbi => "binary_abi",
+        }
+    }
+
+    /// Returns `true` when the format is text based.
+    pub const fn is_text(self) -> bool {
+        matches!(self, Self::Json | Self::JsonLines | Self::Toml)
+    }
+
+    /// Returns `true` when the format represents a record stream.
+    pub const fn is_record_stream(self) -> bool {
+        matches!(self, Self::JsonLines)
+    }
+}
+
+/// Discoverable descriptor for one protocol-owned wire or data schema.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WireSchemaDescriptor {
+    /// Schema family.
+    pub kind: SchemaKind,
+    /// Schema version label.
+    pub version: &'static str,
+    /// Serialization or wire format family.
+    pub format: ProtocolWireFormat,
+    /// Owning repository.
+    pub owner: &'static str,
+    /// Maximum serialized record length accepted by host-mode validation.
+    pub max_record_len: usize,
+    /// Default data class for descriptors in this schema family.
+    pub data_class: DataClass,
+}
+
+impl WireSchemaDescriptor {
+    /// Creates a wire schema descriptor.
+    pub const fn new(
+        kind: SchemaKind,
+        format: ProtocolWireFormat,
+        max_record_len: usize,
+        data_class: DataClass,
+    ) -> Self {
+        Self {
+            kind,
+            version: kind.expected_version(),
+            format,
+            owner: "alani-protocol",
+            max_record_len,
+            data_class,
+        }
+    }
+
+    /// Stable schema label.
+    pub const fn label(self) -> &'static str {
+        self.kind.label()
+    }
+
+    /// Validates descriptor metadata.
+    pub fn validate(self) -> ProtocolResult<()> {
+        SchemaVersion::new(self.kind, self.version).validate()?;
+        validate_label(self.owner, MAX_PROTOCOL_LABEL_LEN)?;
+        if self.max_record_len == 0 {
+            return Err(ProtocolError::InvalidMetadata);
+        }
+        Ok(())
+    }
+}
+
+/// Current protocol schema catalog.
+pub const PROTOCOL_SCHEMAS: [WireSchemaDescriptor; PROTOCOL_SCHEMA_COUNT] = [
+    WireSchemaDescriptor::new(
+        SchemaKind::Message,
+        ProtocolWireFormat::BinaryAbi,
+        MAX_INLINE_PAYLOAD_BYTES as usize,
+        DataClass::Operational,
+    ),
+    WireSchemaDescriptor::new(
+        SchemaKind::Ipc,
+        ProtocolWireFormat::BinaryAbi,
+        MAX_SCHEMA_RECORD_LEN,
+        DataClass::Operational,
+    ),
+    WireSchemaDescriptor::new(
+        SchemaKind::AuditEvent,
+        ProtocolWireFormat::JsonLines,
+        MAX_SCHEMA_RECORD_LEN,
+        DataClass::Sensitive,
+    ),
+    WireSchemaDescriptor::new(
+        SchemaKind::Config,
+        ProtocolWireFormat::Toml,
+        MAX_SCHEMA_RECORD_LEN,
+        DataClass::Operational,
+    ),
+    WireSchemaDescriptor::new(
+        SchemaKind::DeviceDescriptor,
+        ProtocolWireFormat::Json,
+        MAX_SCHEMA_RECORD_LEN,
+        DataClass::Operational,
+    ),
+    WireSchemaDescriptor::new(
+        SchemaKind::CorpusMetadata,
+        ProtocolWireFormat::JsonLines,
+        MAX_SCHEMA_RECORD_LEN,
+        DataClass::Operational,
+    ),
+    WireSchemaDescriptor::new(
+        SchemaKind::ModelMetadata,
+        ProtocolWireFormat::Json,
+        MAX_SCHEMA_RECORD_LEN,
+        DataClass::Operational,
+    ),
+];
+
+/// Returns the current protocol schema catalog.
+pub const fn protocol_schemas() -> &'static [WireSchemaDescriptor; PROTOCOL_SCHEMA_COUNT] {
+    &PROTOCOL_SCHEMAS
+}
+
+/// Finds a schema descriptor by kind.
+pub fn schema_descriptor(kind: SchemaKind) -> Option<WireSchemaDescriptor> {
+    let mut index = 0;
+    while index < PROTOCOL_SCHEMAS.len() {
+        let descriptor = PROTOCOL_SCHEMAS[index];
+        if descriptor.kind == kind {
+            return Some(descriptor);
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Validates the current protocol schema catalog.
+pub fn validate_protocol_schemas() -> ProtocolResult<()> {
+    let mut index = 0;
+    while index < PROTOCOL_SCHEMAS.len() {
+        let descriptor = PROTOCOL_SCHEMAS[index];
+        descriptor.validate()?;
+
+        let mut duplicate_index = index + 1;
+        while duplicate_index < PROTOCOL_SCHEMAS.len() {
+            if PROTOCOL_SCHEMAS[duplicate_index].kind == descriptor.kind {
+                return Err(ProtocolError::InvalidMetadata);
+            }
+            duplicate_index += 1;
+        }
+
+        index += 1;
+    }
+    Ok(())
 }
 
 /// Device class shared in protocol descriptors.

@@ -1,11 +1,14 @@
 use alani_protocol::schema::{CorpusSplit, LicenseState};
 use alani_protocol::{
-    protocol_catalog, AuditDecision, AuditEvent, AuditEventKind, AuditRecordHeader, AuditStatus,
-    ComponentStatus, ConfigDocument, ConfigDomain, ConfigEntry, ConfigFormat, ConfigValue,
-    CorpusMetadata, DataClass, DeviceClass, DeviceDescriptor, EndpointKind, IpcEndpoint,
-    IpcEnvelope, IpcFlow, IpcRouteHint, MessageEnvelope, MessageHeader, MessageKind,
-    MetadataRecord, ModelFormat, ModelMetadata, PayloadRef, ProtocolError, RedactionState,
-    SchemaKind, SchemaRegistry, TraceContext, MESSAGE_FLAG_SHARED_MEMORY,
+    protocol_catalog, protocol_schemas, schema_descriptor, validate_protocol_schemas,
+    AuditDecision, AuditEvent, AuditEventKind, AuditRecordHeader, AuditStatus, ComponentStatus,
+    ConfigDocument, ConfigDomain, ConfigEntry, ConfigFormat, ConfigValue, CorpusMetadata,
+    DataClass, DeviceClass, DeviceDescriptor, EndpointKind, IpcEndpoint, IpcEnvelope, IpcFlow,
+    IpcRouteHint, MessageEnvelope, MessageHeader, MessageKind, MetadataRecord, ModelFormat,
+    ModelMetadata, PayloadRef, ProtocolError, ProtocolWireFormat, RedactionState, SchemaKind,
+    SchemaRegistry, SchemaVersion, TraceContext, AUDIT_EVENT_SCHEMA_VERSION,
+    MESSAGE_FLAG_SHARED_MEMORY, MESSAGE_SCHEMA_VERSION, PROTOCOL_SCHEMA_COUNT, TRACE_FLAG_REMOTE,
+    TRACE_FLAG_SAMPLED,
 };
 
 #[test]
@@ -20,6 +23,46 @@ fn repository_identity_and_catalog_are_stable() {
     );
     assert_eq!(protocol_catalog().validate(), Ok(()));
     assert!(protocol_catalog().features & alani_protocol::PROTOCOL_FEATURE_MESSAGES != 0);
+}
+
+#[test]
+fn trace_context_rejects_reserved_flags_and_bad_parent_spans() {
+    let trace = TraceContext::root(10, 11).with_flags(TRACE_FLAG_SAMPLED | TRACE_FLAG_REMOTE);
+    assert!(trace.is_present());
+    assert!(trace.has_flags(TRACE_FLAG_REMOTE));
+    assert_eq!(trace.validate(), Ok(()));
+
+    let child = trace.child(12);
+    assert_eq!(child.parent_span_id, 11);
+    assert_eq!(child.validate(), Ok(()));
+
+    let reserved = TraceContext::new(1, 2).with_flags(1 << 31);
+    assert_eq!(reserved.validate(), Err(ProtocolError::ReservedBits));
+
+    let self_parent = TraceContext::new(1, 2).with_parent(2);
+    assert_eq!(self_parent.validate(), Err(ProtocolError::InvalidTrace));
+}
+
+#[test]
+fn schema_catalog_advertises_formats_and_rejects_version_drift() {
+    assert_eq!(protocol_schemas().len(), PROTOCOL_SCHEMA_COUNT);
+    assert_eq!(validate_protocol_schemas(), Ok(()));
+
+    let message_version = SchemaVersion::current(SchemaKind::Message);
+    assert_eq!(message_version.version, MESSAGE_SCHEMA_VERSION);
+    assert_eq!(message_version.validate(), Ok(()));
+
+    let drifted = SchemaVersion::new(SchemaKind::Message, AUDIT_EVENT_SCHEMA_VERSION);
+    assert_eq!(drifted.validate(), Err(ProtocolError::InvalidSchemaVersion));
+
+    let audit = schema_descriptor(SchemaKind::AuditEvent).unwrap();
+    assert_eq!(audit.format, ProtocolWireFormat::JsonLines);
+    assert!(audit.format.is_text());
+    assert!(audit.format.is_record_stream());
+
+    let config = schema_descriptor(SchemaKind::Config).unwrap();
+    assert_eq!(config.format, ProtocolWireFormat::Toml);
+    assert!(config.validate().is_ok());
 }
 
 #[test]

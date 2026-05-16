@@ -1,6 +1,6 @@
 # alani-protocol
 
-Shared wire and data schemas for IPC envelopes, audit events, device descriptors, config records, and corpus metadata.
+Shared wire and data schemas for IPC envelopes, audit events, device descriptors, config records, corpus metadata, and model metadata.
 
 | Field | Value |
 |---|---|
@@ -24,6 +24,6 @@ cargo clippy --all-features -- -D warnings
 - `ipc`: IPC endpoint, flow, route-hint, and message-envelope schemas.
 - `audit`: audit event and record-header schemas for append-only evidence contracts.
 - `config`: config document, domain, scalar value, and entry schemas.
-- `schema`: shared device descriptor, corpus metadata, model metadata, and schema-registry records.
+- `schema`: discoverable protocol schema catalog, shared device descriptor, corpus metadata, model metadata, and schema-registry records.
 
 The crate remains dependency-free while sibling repositories stabilize. Keep public API changes synchronized with `docs/repositories/alani-protocol.md`, Doc 42, and Doc 43.

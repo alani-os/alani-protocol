@@ -32,10 +32,12 @@ pub use message::{
     MESSAGE_KNOWN_FLAGS, MESSAGE_SCHEMA_VERSION,
 };
 pub use schema::{
-    CorpusMetadata, DeviceClass, DeviceDescriptor, DeviceState, MetadataRecord, ModelFormat,
-    ModelMetadata, SchemaDescriptor, SchemaKind, SchemaRegistry, SchemaVersion,
+    protocol_schemas, schema_descriptor, validate_protocol_schemas, CorpusMetadata, DeviceClass,
+    DeviceDescriptor, DeviceState, MetadataRecord, ModelFormat, ModelMetadata, ProtocolWireFormat,
+    SchemaDescriptor, SchemaKind, SchemaRegistry, SchemaVersion, WireSchemaDescriptor,
     CORPUS_METADATA_SCHEMA_VERSION, DEVICE_DESCRIPTOR_SCHEMA_VERSION,
-    MODEL_METADATA_SCHEMA_VERSION, SCHEMA_REGISTRY_VERSION,
+    MODEL_METADATA_SCHEMA_VERSION, PROTOCOL_SCHEMAS, PROTOCOL_SCHEMA_COUNT,
+    SCHEMA_REGISTRY_VERSION,
 };
 
 /// Repository name.
@@ -79,6 +81,19 @@ pub const MAX_PROTOCOL_LABEL_LEN: usize = 128;
 
 /// Invalid event/message/record identifier.
 pub const INVALID_PROTOCOL_ID: u128 = 0;
+
+/// Trace was sampled for ordinary telemetry.
+pub const TRACE_FLAG_SAMPLED: u32 = 1 << 0;
+/// Trace carries debug-level metadata.
+pub const TRACE_FLAG_DEBUG: u32 = 1 << 1;
+/// Trace crossed an IPC, syscall, service, or transport boundary.
+pub const TRACE_FLAG_REMOTE: u32 = 1 << 2;
+/// Trace must preserve audit-relevant evidence.
+pub const TRACE_FLAG_AUDIT_REQUIRED: u32 = 1 << 3;
+
+/// Trace flags known by this crate version.
+pub const TRACE_KNOWN_FLAGS: u32 =
+    TRACE_FLAG_SAMPLED | TRACE_FLAG_DEBUG | TRACE_FLAG_REMOTE | TRACE_FLAG_AUDIT_REQUIRED;
 
 /// Result alias used by protocol validation APIs.
 pub type ProtocolResult<T> = Result<T, ProtocolError>;
@@ -232,6 +247,26 @@ impl TraceContext {
         }
     }
 
+    /// Creates a root trace context with sampling enabled.
+    pub const fn root(trace_id: u64, span_id: u64) -> Self {
+        Self {
+            trace_id,
+            span_id,
+            parent_span_id: 0,
+            flags: TRACE_FLAG_SAMPLED,
+        }
+    }
+
+    /// Creates a child trace context preserving trace flags.
+    pub const fn child(self, span_id: u64) -> Self {
+        Self {
+            trace_id: self.trace_id,
+            span_id,
+            parent_span_id: self.span_id,
+            flags: self.flags,
+        }
+    }
+
     /// Sets parent span identifier.
     pub const fn with_parent(mut self, parent_span_id: u64) -> Self {
         self.parent_span_id = parent_span_id;
@@ -249,12 +284,23 @@ impl TraceContext {
         self.trace_id != 0 && self.span_id != 0
     }
 
+    /// Returns `true` when all requested flags are set.
+    pub const fn has_flags(self, flags: u32) -> bool {
+        self.flags & flags == flags
+    }
+
     /// Validates trace identifiers.
     pub const fn validate(self) -> ProtocolResult<()> {
-        if (self.trace_id == 0) != (self.span_id == 0) {
+        if self.flags & !TRACE_KNOWN_FLAGS != 0 {
+            return Err(ProtocolError::ReservedBits);
+        }
+        if self.trace_id == 0 && self.span_id == 0 && self.parent_span_id == 0 {
+            return Ok(());
+        }
+        if self.trace_id == 0 || self.span_id == 0 {
             return Err(ProtocolError::InvalidTrace);
         }
-        if self.parent_span_id != 0 && !self.is_present() {
+        if self.parent_span_id != 0 && self.parent_span_id == self.span_id {
             return Err(ProtocolError::InvalidTrace);
         }
         Ok(())
